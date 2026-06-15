@@ -103,18 +103,27 @@ def _wait_for_running(container, timeout: int = 30) -> None:
     raise RuntimeError("Sandbox container did not start in time")
 
 
-def _wait_for_ui(container, timeout: int = 60) -> bool:
-    """Wait until the sandbox's own web UI responds (checked inside the container)."""
+def _wait_for_ui(container, timeout: int = 90) -> bool:
+    """Wait until the sandbox's own web UI responds reliably.
+
+    Require two consecutive successful fetches a few seconds apart to avoid
+    marking the session ready during a transient startup state.
+    """
     cmd = ["/bin/sh", "-c", "wget -qO- http://localhost:5800 >/dev/null 2>&1"]
     deadline = time.time() + timeout
+    consecutive = 0
     while time.time() < deadline:
         try:
             exit_code, _ = container.exec_run(cmd, demux=False)
             if exit_code == 0:
-                return True
+                consecutive += 1
+                if consecutive >= 2:
+                    return True
+            else:
+                consecutive = 0
         except Exception:
-            pass
-        time.sleep(2)
+            consecutive = 0
+        time.sleep(3)
     return False
 
 

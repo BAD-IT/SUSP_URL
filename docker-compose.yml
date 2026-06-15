@@ -5,14 +5,31 @@ services:
       - "${APP_PORT:-8080}:5000"
     volumes:
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
+      - susp-url-data:/app/data
+      - susp-url-screenshots:/app/screenshots
     environment:
       - DOCKER_HOST=unix:///var/run/docker.sock
       - SANDBOX_IMAGE=${SANDBOX_IMAGE:-jlesage/firefox}
       - SANDBOX_NETWORK=susp-sandbox
+      - SCANNER_IMAGE=susp_url-scanner
       - SECRET_KEY=${SECRET_KEY:-}
+      - REPORT_TTL_SECONDS=${REPORT_TTL_SECONDS:-3600}
     restart: unless-stopped
+
+  scanner:
+    build: ./scanner
+    image: susp_url-scanner
+    profiles:
+      - build
 
 networks:
   sandbox:
     name: susp-sandbox
     driver: bridge
+
+volumes:
+  susp-url-data:
+    name: susp-url-data
+  susp-url-screenshots:
+    name: susp-url-screenshots
+

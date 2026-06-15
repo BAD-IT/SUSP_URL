@@ -12,6 +12,15 @@
     }
     .session-meta { flex: 1; min-width: 260px; }
     .session-controls { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+    .scan-panel {
+        background: #0f172a;
+        border: 1px solid #334155;
+        border-radius: 0.5rem;
+        padding: 1rem;
+        margin-bottom: 1rem;
+    }
+    .scan-panel h3 { margin: 0 0 0.5rem; font-size: 1rem; }
+    .scan-panel p { margin: 0.25rem 0; color: var(--muted); font-size: 0.9rem; }
     .sandbox-wrap { margin-top: 1rem; }
     #status-message { margin-top: 0.5rem; font-size: 0.9rem; min-height: 1.5rem; }
 </style>
@@ -31,6 +40,11 @@
         </div>
     </div>
 
+    <div class="scan-panel">
+        <h3>Background scan</h3>
+        <p id="scan-status">Starting scanner...</p>
+    </div>
+
     <div class="sandbox-wrap">
         <div id="loader" class="loader">
             <div class="spinner"></div>
@@ -42,7 +56,7 @@
 
 <script>
     const sid = {{ sid|tojson }};
-    const reportUrl = {{ url_for('report', sid=sid)|tojson }};
+    const reportUrl = {{ url_for('report', analysis_id=analysis_id)|tojson }};
     let endTime = null;
     let timerInterval = null;
 
@@ -68,6 +82,17 @@
         }
     }
 
+    function updateScanStatus(status) {
+        const el = document.getElementById('scan-status');
+        const labels = {
+            pending: 'Scanner is starting...',
+            running: 'Scanner is crawling the site...',
+            finished: 'Scan complete — report will be ready soon.',
+            failed: 'Scan failed — report may be incomplete.'
+        };
+        el.textContent = labels[status] || status;
+    }
+
     async function loadStatus() {
         try {
             const res = await fetch(`/session/${sid}/status`);
@@ -79,6 +104,7 @@
             }
 
             endTime = Date.now() + data.remaining_seconds * 1000;
+            updateScanStatus(data.scan_status);
 
             const loader = document.getElementById('loader');
             const frame = document.getElementById('sandbox-frame');

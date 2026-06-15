@@ -61,7 +61,7 @@ def main():
                 entry["title"] = page.title()
                 filename = f"{len(pages) + 1:03d}_{safe_name(url)}.png"
                 screenshot_path = os.path.join(out_dir, filename)
-                page.screenshot(path=screenshot_path, full_page=True)
+                page.screenshot(path=screenshot_path)
                 entry["filename"] = filename
 
                 # Extract same-domain links only from the first page to keep the scan bounded.

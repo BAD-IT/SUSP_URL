@@ -224,7 +224,7 @@ def create_session(target_url: str, host: str, analysis_id: int) -> str:
                 "FF_OPEN_URL": target_url,
                 "FF_KIOSK": "0",
             },
-            ports={f"{SANDBOX_PORT}/tcp": ("0.0.0.0", None)},
+            ports={f"{SANDBOX_PORT}/tcp": ("127.0.0.1", None)},
             network=SANDBOX_NETWORK,
             detach=True,
             auto_remove=True,
@@ -353,7 +353,9 @@ def start():
         return redirect(url_for("url_exists", url=url))
 
     analysis_id = database.create_or_reset_analysis(url)
-    host = request.host.split(":")[0]
+    # Bind the live sandbox UI to the host loopback so the browser can reach it
+    # reliably via IPv4 and avoid IPv6/localhost resolution issues.
+    host = "127.0.0.1"
     try:
         sid = create_session(url, host, analysis_id)
     except Exception as e:
@@ -397,7 +399,7 @@ def analyse_again():
     _delete_screenshot_files_for_analysis(analysis_id)
     database.clear_screenshots(analysis_id)
 
-    host = request.host.split(":")[0]
+    host = "127.0.0.1"
     try:
         sid = create_session(url, host, analysis_id)
     except Exception as e:

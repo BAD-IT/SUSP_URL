@@ -1,0 +1,18 @@
+services:
+  web:
+    build: .
+    ports:
+      - "${APP_PORT:-8080}:5000"
+    volumes:
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - SANDBOX_IMAGE=${SANDBOX_IMAGE:-jlesage/firefox}
+      - SANDBOX_NETWORK=susp-sandbox
+      - SECRET_KEY=${SECRET_KEY:-}
+    restart: unless-stopped
+
+networks:
+  sandbox:
+    name: susp-sandbox
+    driver: bridge

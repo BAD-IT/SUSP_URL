@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Report - Suspicious URL Analyzer{% endblock %}
+{% block content %}
+<div class="card card-wide">
+    <h2>Session report</h2>
+    <p>The isolated sandbox has been destroyed. Below is a summary of the session.</p>
+
+    <table>
+        <tr>
+            <th>Target URL</th>
+            <td><a href="{{ target_url }}" target="_blank" rel="noopener noreferrer">{{ target_url }}</a></td>
+        </tr>
+        <tr>
+            <th>Status</th>
+            <td>
+                {% if status == 'stopped' %}
+                    <span class="badge badge-info">Stopped by user</span>
+                {% elif status == 'timeout' %}
+                    <span class="badge badge-warning">Time limit reached</span>
+                {% else %}
+                    <span class="badge badge-info">{{ status }}</span>
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <th>Started at</th>
+            <td>{{ start_time }}</td>
+        </tr>
+        <tr>
+            <th>Ended at</th>
+            <td>{{ ended_at }}</td>
+        </tr>
+        <tr>
+            <th>Duration</th>
+            <td>{{ duration }}</td>
+        </tr>
+        <tr>
+            <th>Session ID</th>
+            <td><code>{{ sid }}</code></td>
+        </tr>
+        <tr>
+            <th>Sandbox container</th>
+            <td><code>{{ container_name }}</code></td>
+        </tr>
+    </table>
+
+    <div class="actions">
+        <a href="/" class="btn btn-primary">Analyze another URL</a>
+    </div>
+</div>
+{% endblock %}

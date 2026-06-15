@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Enter URL - Suspicious URL Analyzer{% endblock %}
+{% block content %}
+<div class="card">
+    <h2>Analyze a suspicious URL or domain</h2>
+    <p>Enter the URL or domain you want to investigate. A fresh, isolated browser sandbox will be started for you.</p>
+
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+
+    <form method="POST" action="/start">
+        <label for="url">URL or domain</label>
+        <input type="text" id="url" name="url" placeholder="https://example.com or example.com" required autofocus>
+        <div class="actions">
+            <button type="submit" class="btn btn-primary">Start isolated session</button>
+        </div>
+    </form>
+</div>
+{% endblock %}

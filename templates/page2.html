@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}Live Session - Suspicious URL Analyzer{% endblock %}
+{% block head %}
+<style>
+    .session-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 1rem;
+        flex-wrap: wrap;
+        margin-bottom: 1rem;
+    }
+    .session-meta { flex: 1; min-width: 260px; }
+    .session-controls { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+    .sandbox-wrap { margin-top: 1rem; }
+    #status-message { margin-top: 0.5rem; font-size: 0.9rem; min-height: 1.5rem; }
+</style>
+{% endblock %}
+{% block content %}
+<div class="card card-wide">
+    <div class="session-header">
+        <div class="session-meta">
+            <h2>Live sandbox session</h2>
+            <p>Target: <strong>{{ target_url }}</strong></p>
+            <p>Time remaining: <span id="timer" class="timer">--:--</span></p>
+            <p id="status-message"></p>
+        </div>
+        <div class="session-controls">
+            <button id="add-time" class="btn btn-warning">+1 minute</button>
+            <button id="stop-session" class="btn btn-danger">Stop &amp; view report</button>
+        </div>
+    </div>
+
+    <div class="sandbox-wrap">
+        <div id="loader" class="loader">
+            <div class="spinner"></div>
+            <span>Starting isolated browser sandbox...</span>
+        </div>
+        <iframe id="sandbox-frame" style="display:none;" allow="fullscreen"></iframe>
+    </div>
+</div>
+
+<script>
+    const sid = {{ sid|tojson }};
+    const reportUrl = {{ url_for('report', sid=sid)|tojson }};
+    let endTime = null;
+    let timerInterval = null;
+
+    function formatRemaining(seconds) {
+        if (seconds <= 0) return '00:00';
+        const m = Math.floor(seconds / 60);
+        const s = Math.floor(seconds % 60);
+        return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    }
+
+    function updateTimer() {
+        if (!endTime) return;
+        const remaining = Math.floor((endTime - Date.now()) / 1000);
+        const el = document.getElementById('timer');
+        el.textContent = formatRemaining(remaining);
+        el.classList.remove('timer-warning', 'timer-danger');
+        if (remaining <= 30) el.classList.add('timer-danger');
+        else if (remaining <= 60) el.classList.add('timer-warning');
+
+        if (remaining <= 0) {
+            clearInterval(timerInterval);
+            window.location.href = reportUrl;
+        }
+    }
+
+    async function loadStatus() {
+        try {
+            const res = await fetch(`/session/${sid}/status`);
+            const data = await res.json();
+
+            if (!data.active) {
+                window.location.href = reportUrl;
+                return;
+            }
+
+            endTime = Date.now() + data.remaining_seconds * 1000;
+
+            const loader = document.getElementById('loader');
+            const frame = document.getElementById('sandbox-frame');
+            const statusMsg = document.getElementById('status-message');
+
+            if (data.ready && !frame.src) {
+                loader.style.display = 'none';
+                frame.src = data.vnc_url;
+                frame.style.display = 'block';
+                statusMsg.textContent = 'Sandbox is ready. Click, scroll and navigate inside the browser.';
+            } else if (!data.ready) {
+                statusMsg.textContent = 'Sandbox is still starting...';
+            }
+        } catch (e) {
+            console.error('Status check failed', e);
+        }
+    }
+
+    document.getElementById('add-time').addEventListener('click', async () => {
+        const btn = document.getElementById('add-time');
+        btn.disabled = true;
+        try {
+            const res = await fetch(`/session/${sid}/extend`, { method: 'POST' });
+            const data = await res.json();
+            if (data.error) {
+                alert(data.error);
+            } else {
+                endTime = Date.now() + data.remaining_seconds * 1000;
+                updateTimer();
+            }
+        } finally {
+            btn.disabled = false;
+        }
+    });
+
+    document.getElementById('stop-session').addEventListener('click', async () => {
+        if (!confirm('Stop the live session and view the report?')) return;
+        await fetch(`/session/${sid}/stop`, { method: 'POST' });
+        window.location.href = reportUrl;
+    });
+
+    loadStatus();
+    setInterval(loadStatus, 2000);
+    timerInterval = setInterval(updateTimer, 1000);
+</script>
+{% endblock %}

@@ -2,13 +2,18 @@ import atexit
 import logging
 import os
 import secrets
+import shutil
 import threading
 import time
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlparse
 
 import docker
-from flask import Flask, redirect, render_template, request, jsonify, url_for
+from flask import Flask, redirect, render_template, request, jsonify, url_for, send_from_directory, abort
+
+import database
+import scanner_mgr
+import scoring
+from url_utils import normalize_url, get_domain
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,8 +23,10 @@ app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
 # Configuration
 SANDBOX_IMAGE = os.environ.get("SANDBOX_IMAGE", "jlesage/firefox")
-SANDBOX_NETWORK = os.environ.get("SANDBOX_NETWORK", "bridge")
+SANDBOX_NETWORK = os.environ.get("SANDBOX_NETWORK", "susp-sandbox")
 SANDBOX_PORT = 5800
+SCANNER_MAX_PAGES = int(os.environ.get("SCANNER_MAX_PAGES", "5"))
+
 DEFAULT_DURATION = timedelta(minutes=2)
 MAX_DURATION = timedelta(minutes=5)
 EXTEND_STEP = timedelta(minutes=1)
@@ -35,23 +42,12 @@ except Exception as e:
     logger.error("Unable to connect to Docker: %s", e)
     docker_client = None
 
+# Initialise database schema on startup.
+database.init_db()
+
 
 def now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def normalize_url(raw: str) -> str:
-    raw = raw.strip()
-    if not raw:
-        raise ValueError("URL is required")
-    if not raw.startswith(("http://", "https://")):
-        raw = "https://" + raw
-    parsed = urlparse(raw)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("Only HTTP and HTTPS URLs are supported")
-    if not parsed.netloc:
-        raise ValueError("Invalid URL or domain")
-    return raw
 
 
 def format_duration(td: timedelta) -> str:
@@ -122,7 +118,73 @@ def _wait_for_ui(container, timeout: int = 60) -> bool:
     return False
 
 
-def create_session(target_url: str, host: str) -> str:
+def _delete_screenshot_files(sid: str) -> None:
+    path = os.path.join(scanner_mgr.SCREENSHOTS_DIR, sid)
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _process_scan_results(sid: str) -> None:
+    """Wait for scanner to finish and persist results. Runs in a background thread."""
+    with sessions_lock:
+        session = sessions.get(sid)
+        if not session:
+            return
+        scanner_id = session.get("scanner_container_id")
+        analysis_id = session["analysis_id"]
+
+    if not scanner_id:
+        database.fail_analysis(analysis_id)
+        return
+
+    # Poll until scanner finishes or times out (max 5 minutes).
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        status = scanner_mgr.get_scanner_status(scanner_id, sid)
+        if status == "finished":
+            break
+        if status == "failed":
+            database.fail_analysis(analysis_id)
+            return
+        time.sleep(2)
+    else:
+        logger.warning("Scanner for %s did not finish in time", sid)
+        database.fail_analysis(analysis_id)
+        return
+
+    meta = scanner_mgr.read_scan_results(sid)
+    if not meta:
+        database.fail_analysis(analysis_id)
+        return
+
+    pages = [p for p in meta.get("pages", []) if p.get("filename")]
+    score, verdict, summary = scoring.calculate_score(session["target_url"], pages)
+
+    database.clear_screenshots(analysis_id)
+    os.makedirs(os.path.join(scanner_mgr.SCREENSHOTS_DIR, sid), exist_ok=True)
+
+    for idx, page in enumerate(pages, start=1):
+        # Store the relative path so the web app can serve the file and clean it up later.
+        rel_path = f"{sid}/{page['filename']}"
+        database.add_screenshot(
+            analysis_id=analysis_id,
+            url=page["url"],
+            title=page.get("title"),
+            filename=rel_path,
+            order_index=idx,
+        )
+
+    database.complete_analysis(
+        analysis_id=analysis_id,
+        score=score,
+        verdict=verdict,
+        summary=summary,
+        report={"pages": meta.get("pages", []), "page_count": len(pages)},
+    )
+    logger.info("Analysis %s completed: score=%s verdict=%s", analysis_id, score, verdict)
+
+
+def create_session(target_url: str, host: str, analysis_id: int) -> str:
     if docker_client is None:
         raise RuntimeError("Docker is not available")
 
@@ -132,9 +194,11 @@ def create_session(target_url: str, host: str) -> str:
 
     session = {
         "sid": sid,
+        "analysis_id": analysis_id,
         "target_url": target_url,
         "container_name": container_name,
         "container_id": None,
+        "scanner_container_id": None,
         "host": host,
         "host_port": None,
         "vnc_url": None,
@@ -145,11 +209,13 @@ def create_session(target_url: str, host: str) -> str:
         "reason": None,
         "ended_at": None,
         "ready": False,
+        "scan_status": "pending",
     }
 
     with sessions_lock:
         sessions[sid] = session
 
+    # Start live sandbox
     try:
         container = docker_client.containers.run(
             SANDBOX_IMAGE,
@@ -171,6 +237,7 @@ def create_session(target_url: str, host: str) -> str:
         with sessions_lock:
             sessions[sid]["status"] = "failed"
             sessions[sid]["reason"] = str(e)
+        database.fail_analysis(analysis_id)
         raise RuntimeError(f"Failed to start sandbox container: {e}")
 
     with sessions_lock:
@@ -188,15 +255,19 @@ def create_session(target_url: str, host: str) -> str:
     with sessions_lock:
         sessions[sid]["host_port"] = host_port
         sessions[sid]["vnc_url"] = vnc_url
+        sessions[sid]["ready"] = True
 
-    # Wait for the noVNC UI to actually respond before exposing it to the user.
-    if _wait_for_ui(container):
+    # Start background scanner
+    try:
+        scanner_id = scanner_mgr.start_scanner(analysis_id, target_url, sid, SCANNER_MAX_PAGES)
         with sessions_lock:
-            sessions[sid]["ready"] = True
-    else:
-        logger.warning("Sandbox UI for %s did not become ready in time", sid)
+            sessions[sid]["scanner_container_id"] = scanner_id
+            sessions[sid]["scan_status"] = "running"
+        threading.Thread(target=_process_scan_results, args=(sid,), daemon=True).start()
+    except Exception as e:
+        logger.exception("Failed to start scanner for %s", sid)
         with sessions_lock:
-            sessions[sid]["ready"] = True
+            sessions[sid]["scan_status"] = "failed"
 
     _schedule_expiry(sid)
     return sid
@@ -238,6 +309,7 @@ def destroy_all_sessions():
     for sid in active:
         destroy_session(sid, "shutdown")
 
+
 atexit.register(destroy_all_sessions)
 
 
@@ -259,6 +331,7 @@ def cleanup_orphaned_sandboxes() -> None:
         logger.error("Failed to clean up orphaned sandboxes: %s", e)
 
 
+scanner_mgr.cleanup_orphaned_scanners()
 cleanup_orphaned_sandboxes()
 
 
@@ -275,14 +348,81 @@ def start():
     except ValueError as e:
         return render_template("page1.html", error=str(e)), 400
 
+    existing = database.find_analysis(url)
+    if existing:
+        return redirect(url_for("url_exists", url=url))
+
+    analysis_id = database.create_or_reset_analysis(url)
     host = request.host.split(":")[0]
     try:
-        sid = create_session(url, host)
+        sid = create_session(url, host, analysis_id)
     except Exception as e:
         logger.exception("Start session failed")
+        database.fail_analysis(analysis_id)
         return render_template("page1.html", error=str(e)), 500
 
     return redirect(url_for("session_page", sid=sid))
+
+
+@app.route("/url-exists")
+def url_exists():
+    raw = request.args.get("url", "")
+    try:
+        url = normalize_url(raw)
+    except ValueError:
+        return render_template("page1.html", error="Invalid URL"), 400
+
+    analysis = database.find_analysis(url)
+    if not analysis:
+        return redirect(url_for("index"))
+
+    fresh = database.is_fresh(analysis)
+    return render_template(
+        "page_exists.html",
+        url=url,
+        analysis=analysis,
+        fresh=fresh,
+    )
+
+
+@app.route("/analyse-again", methods=["POST"])
+def analyse_again():
+    raw = request.form.get("url", "")
+    try:
+        url = normalize_url(raw)
+    except ValueError as e:
+        return render_template("page1.html", error=str(e)), 400
+
+    analysis_id = database.create_or_reset_analysis(url)
+    _delete_screenshot_files_for_analysis(analysis_id)
+    database.clear_screenshots(analysis_id)
+
+    host = request.host.split(":")[0]
+    try:
+        sid = create_session(url, host, analysis_id)
+    except Exception as e:
+        logger.exception("Start re-analysis failed")
+        database.fail_analysis(analysis_id)
+        return render_template("page1.html", error=str(e)), 500
+
+    return redirect(url_for("session_page", sid=sid))
+
+
+def _delete_screenshot_files_for_analysis(analysis_id: int) -> None:
+    """Delete old screenshot files for an analysis before re-analysing."""
+    base = scanner_mgr.SCREENSHOTS_DIR
+    for shot in database.get_screenshots(analysis_id):
+        path = os.path.join(base, shot["filename"])
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    # Clean up empty session directories.
+    if os.path.isdir(base):
+        for name in os.listdir(base):
+            path = os.path.join(base, name)
+            if os.path.isdir(path) and not os.listdir(path):
+                shutil.rmtree(path, ignore_errors=True)
 
 
 @app.route("/session/<sid>")
@@ -291,8 +431,13 @@ def session_page(sid):
     if not session:
         return render_template("page1.html", error="Session not found"), 404
     if session["status"] != "active":
-        return redirect(url_for("report", sid=sid))
-    return render_template("page2.html", sid=sid, target_url=session["target_url"])
+        return redirect(url_for("report", analysis_id=session["analysis_id"]))
+    return render_template(
+        "page2.html",
+        sid=sid,
+        target_url=session["target_url"],
+        analysis_id=session["analysis_id"],
+    )
 
 
 @app.route("/session/<sid>/status")
@@ -300,7 +445,17 @@ def session_status(sid):
     session = get_session(sid)
     if not session:
         return jsonify({"active": False}), 404
+
     remaining = max(0, int((session["end_time"] - now()).total_seconds()))
+
+    scan_status = session.get("scan_status", "pending")
+    if scan_status == "running" and session.get("scanner_container_id"):
+        scan_status = scanner_mgr.get_scanner_status(
+            session["scanner_container_id"], sid
+        )
+        with sessions_lock:
+            sessions[sid]["scan_status"] = scan_status
+
     return jsonify({
         "active": session["status"] == "active",
         "ready": session["ready"],
@@ -308,6 +463,7 @@ def session_status(sid):
         "end_time": int(session["end_time"].timestamp() * 1000),
         "max_end_time": int(session["max_end_time"].timestamp() * 1000),
         "remaining_seconds": remaining,
+        "scan_status": scan_status,
     })
 
 
@@ -336,29 +492,64 @@ def extend_session(sid):
 
 @app.route("/session/<sid>/stop", methods=["POST"])
 def stop_session(sid):
-    destroy_session(sid, "stopped")
-    return jsonify({"redirect": url_for("report", sid=sid)})
-
-
-@app.route("/report/<sid>")
-def report(sid):
     session = get_session(sid)
     if not session:
-        return render_template("page1.html", error="Session not found"), 404
+        return jsonify({"redirect": url_for("index")})
+    destroy_session(sid, "stopped")
+    return jsonify({"redirect": url_for("report", analysis_id=session["analysis_id"])})
 
-    ended_at = session["ended_at"] or now()
-    duration = ended_at - session["start_time"]
+
+@app.route("/report/<int:analysis_id>")
+def report(analysis_id):
+    analysis = database.get_analysis_by_id(analysis_id)
+    if not analysis:
+        return render_template("page1.html", error="Report not found"), 404
+
+    screenshots = database.get_screenshots(analysis_id)
+    fresh = database.is_fresh(analysis)
+    ended_at_str = analysis.get("updated_at") or analysis.get("created_at") or now().isoformat()
+    created_at_str = analysis.get("created_at") or ended_at_str
+    ended_at = datetime.fromisoformat(ended_at_str)
+    created_at = datetime.fromisoformat(created_at_str)
+    duration = ended_at - created_at
+
     return render_template(
         "page3.html",
-        sid=sid,
-        target_url=session["target_url"],
-        status=session["status"],
-        start_time=session["start_time"].strftime("%Y-%m-%d %H:%M:%S UTC"),
-        ended_at=ended_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        analysis=analysis,
+        screenshots=screenshots,
+        fresh=fresh,
         duration=format_duration(duration),
-        container_name=session["container_name"],
+        ended_at=ended_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
     )
 
 
+@app.route("/report/<int:analysis_id>/status")
+def report_status(analysis_id):
+    analysis = database.get_analysis_by_id(analysis_id)
+    if not analysis:
+        return jsonify({"found": False}), 404
+    return jsonify({
+        "found": True,
+        "status": analysis["status"],
+        "score": analysis["score"],
+        "verdict": analysis["verdict"],
+    })
+
+
+@app.route("/screenshots/<path:filename>")
+def serve_screenshot(filename):
+    directory = scanner_mgr.SCREENSHOTS_DIR
+    try:
+        return send_from_directory(directory, filename)
+    except FileNotFoundError:
+        abort(404)
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
 if __name__ == "__main__":
+    database.init_db()
     app.run(host="0.0.0.0", port=5000, threaded=True)

@@ -1,33 +1,139 @@
 {% extends "base.html" %}
 {% block title %}Report - Suspicious URL Analyzer{% endblock %}
+{% block head %}
+<style>
+    .verdict-box {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        padding: 1.25rem;
+        border-radius: 0.75rem;
+        margin-bottom: 1rem;
+        border: 1px solid #334155;
+    }
+    .score-circle {
+        width: 80px;
+        height: 80px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.5rem;
+        font-weight: 700;
+        flex-shrink: 0;
+        background: #0f172a;
+        border: 4px solid #334155;
+    }
+    .score-safe { border-color: #22c55e; color: #86efac; }
+    .score-neutral { border-color: #f59e0b; color: #fde68a; }
+    .score-suspicious { border-color: #f97316; color: #fdba74; }
+    .score-high { border-color: #ef4444; color: #fca5a5; }
+    .verdict-text h2 { margin: 0; font-size: 1.5rem; }
+    .verdict-text p { margin: 0.25rem 0 0; color: var(--muted); }
+    .summary {
+        background: #0f172a;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border: 1px solid #334155;
+        margin-bottom: 1rem;
+    }
+    .thumbnails {
+        display: flex;
+        gap: 0.75rem;
+        overflow-x: auto;
+        padding-bottom: 0.5rem;
+        margin-top: 0.5rem;
+    }
+    .thumbnails a {
+        flex: 0 0 auto;
+        border: 1px solid #334155;
+        border-radius: 0.5rem;
+        overflow: hidden;
+        background: #0f172a;
+        text-decoration: none;
+    }
+    .thumbnails img {
+        height: 140px;
+        width: auto;
+        display: block;
+    }
+    .thumb-label {
+        padding: 0.35rem 0.5rem;
+        font-size: 0.75rem;
+        color: var(--muted);
+        max-width: 220px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+</style>
+{% endblock %}
 {% block content %}
 <div class="card card-wide">
-    <h2>Session report</h2>
-    <p>The isolated sandbox has been destroyed. Below is a summary of the session.</p>
+    <h2>Analysis report</h2>
+
+    {% if analysis.status == 'pending' %}
+    <div class="loader">
+        <div class="spinner"></div>
+        <span>Scan is still running — this page will update automatically.</span>
+    </div>
+    {% endif %}
+
+    <div class="verdict-box">
+        <div class="score-circle {% if analysis.score <= 30 %}score-safe{% elif analysis.score <= 60 %}score-neutral{% elif analysis.score <= 85 %}score-suspicious{% else %}score-high{% endif %}">
+            {{ analysis.score if analysis.score is not none else '-' }}
+        </div>
+        <div class="verdict-text">
+            <h2>{{ analysis.verdict or 'Analysis in progress' }}</h2>
+            <p>Risk score out of 100</p>
+        </div>
+    </div>
+
+    {% if analysis.summary %}
+    <div class="summary">
+        <strong>Summary:</strong> {{ analysis.summary }}
+    </div>
+    {% endif %}
+
+    {% if not fresh %}
+    <div class="error">
+        This report is older than the freshness threshold. Results may be outdated.
+    </div>
+    {% endif %}
+
+    <h3>Screenshots</h3>
+    {% if screenshots %}
+    <div class="thumbnails">
+        {% for shot in screenshots %}
+        <a href="{{ url_for('serve_screenshot', filename=shot.filename) }}" target="_blank" rel="noopener noreferrer">
+            <img src="{{ url_for('serve_screenshot', filename=shot.filename) }}" alt="Screenshot of {{ shot.url }}">
+            <div class="thumb-label" title="{{ shot.url }}">{{ shot.url }}</div>
+        </a>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="muted">No screenshots available yet.</p>
+    {% endif %}
 
     <table>
         <tr>
             <th>Target URL</th>
-            <td><a href="{{ target_url }}" target="_blank" rel="noopener noreferrer">{{ target_url }}</a></td>
+            <td><a href="{{ analysis.url }}" target="_blank" rel="noopener noreferrer">{{ analysis.url }}</a></td>
         </tr>
         <tr>
             <th>Status</th>
             <td>
-                {% if status == 'stopped' %}
-                    <span class="badge badge-info">Stopped by user</span>
-                {% elif status == 'timeout' %}
-                    <span class="badge badge-warning">Time limit reached</span>
+                {% if analysis.status == 'completed' %}
+                    <span class="badge badge-success">Completed</span>
+                {% elif analysis.status == 'failed' %}
+                    <span class="badge badge-danger">Failed</span>
                 {% else %}
-                    <span class="badge badge-info">{{ status }}</span>
+                    <span class="badge badge-warning">In progress</span>
                 {% endif %}
             </td>
         </tr>
         <tr>
-            <th>Started at</th>
-            <td>{{ start_time }}</td>
-        </tr>
-        <tr>
-            <th>Ended at</th>
+            <th>Last analysed</th>
             <td>{{ ended_at }}</td>
         </tr>
         <tr>
@@ -35,17 +141,35 @@
             <td>{{ duration }}</td>
         </tr>
         <tr>
-            <th>Session ID</th>
-            <td><code>{{ sid }}</code></td>
-        </tr>
-        <tr>
-            <th>Sandbox container</th>
-            <td><code>{{ container_name }}</code></td>
+            <th>Analysis ID</th>
+            <td><code>{{ analysis.id }}</code></td>
         </tr>
     </table>
 
     <div class="actions">
         <a href="/" class="btn btn-primary">Analyze another URL</a>
+        <form method="POST" action="{{ url_for('analyse_again') }}" style="display:inline">
+            <input type="hidden" name="url" value="{{ analysis.url }}">
+            <button type="submit" class="btn btn-warning">Analyse again</button>
+        </form>
     </div>
 </div>
+
+{% if analysis.status == 'pending' %}
+<script>
+    const analysisId = {{ analysis.id }};
+    async function poll() {
+        try {
+            const res = await fetch(`/report/${analysisId}/status`);
+            const data = await res.json();
+            if (data.status === 'completed' || data.status === 'failed') {
+                window.location.reload();
+            }
+        } catch (e) {
+            console.error('Report poll failed', e);
+        }
+    }
+    setInterval(poll, 3000);
+</script>
+{% endif %}
 {% endblock %}
